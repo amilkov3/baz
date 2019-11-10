@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package dfs_service;
+
+service DFSService {
+
+    // Add your service calls here
+
+    // 1. REQUIRED (Parts 1 & 2): A method to store files on the server
+
+    // 2. REQUIRED (Parts 1 & 2): A method to fetch files from the server
+
+    // 3. REQUIRED (Parts 1 & 2): A method to list all files on the server
+
+    // 4. REQUIRED (Parts 1 & 2): A method to get the status of a file on the server
+
+    // 5. REQUIRED (Part 2 only): A method to request a write lock from the server
+
+    // 6. REQUIRED (Part 2 only): A method named CallbackList to handle asynchronous file listing requests
+    //                            from a client. This method should return a listing of files along with their
+    //                            attribute information. The expected attribute information should include name,
+    //                            size, modified time, and creation time.
+
+    // 7. REQUIRED (Part 2 only): A method to delete a file from the server
+
+    // 8. Any other methods you deem necessary to complete the tasks of this assignment
+
+
+}
+
+// Add your message types here
+
