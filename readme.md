@@ -70,7 +70,7 @@ dfs_log(LL_DEBUG) << "Type your message here: " << add_a_variable << ", add more
 - [gRPC C++ Reference](https://grpc.github.io/grpc/cpp/index.html)
 - [Protocol Buffers 3 Language Guide](https://developers.google.com/protocol-buffers/docs/proto3)
 - [gRPC C++ Examples](https://github.com/grpc/grpc/tree/master/examples/cpp)
-- [gRPC C++ Tutorial](https://grpc.io/docs/tutorials/basic/c/)
+- [gRPC C++ Tutorial](https://grpc.io/docs/tutorials/basic/cpp/)
 - [Protobuffers Scalar types](https://developers.google.com/protocol-buffers/docs/proto3#scalar)
 - [gRPC Status Codes](https://github.com/grpc/grpc/blob/master/doc/statuscodes.md)
 - [gRPC Deadline](https://grpc.io/blog/deadlines/)
