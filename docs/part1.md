@@ -7,11 +7,11 @@ In Part 1, you will build a series of remote procedure calls (RPC) and message t
 The goal of part 1 is to generate an RPC service that will perform the following operations on a file:
 
 * Fetch a file from a remote server and transfer its contents via gRPC
-* Store a file to a remote server and transfer its data via gRPC
+* Store a file to a remote server and transfer its contents via gRPC
 * List all files on the remote server:
 
     * For this assignment, the server is only required to contain files in a single directory; it is not necessary to manage nested directories.
-    * The file listing should include the file name and the modified time (_mtime_) of the file data in seconds from the epoch.
+    * The file listing should include the file name and the modified time (_mtime_) of the file contents in seconds from the epoch.
 
 * Get the following attributes for a file on the remote server:
 
