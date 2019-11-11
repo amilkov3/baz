@@ -80,8 +80,6 @@ static void HandleAsyncRPC(dfs_service::DFSService::AsyncService* service,
             dfs_log(LL_ERROR) << "HandleAsyncRPC failed to get an ok from completion queue. Did the client crash?";
             continue;
         }
-        if (!ok) {
-        }
         static_cast<DFSCallData<RequestT, ResponseT>*>(tag)->Proceed();
     }
 }
