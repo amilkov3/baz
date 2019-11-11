@@ -27,13 +27,13 @@ The client should be able to request each of the operations described above for 
 
 A high-level sequence diagram of the expected interactions in part 1 is available in the [docs/part1-sequence.pdf](part1-sequence.pdf) file of this repository.
 
-A high-level class diagram is avaliable in [docs/part1-class-diagram.jpg](part1-class-diagram.jpg). However, you are only required to understand and work with the student code sections indicated. 
+A high-level class diagram is avaliable in [docs/part1-class-diagram.jpg](part1-class-diagram.jpg). However, you are only required to understand and work with the student code sections indicated.
 
 ## Protocol Buffers and gRPC
 
 To begin part 1, you should first familiarize yourself with the basics of using Protocol Buffers. In particular, you should focus on the use of RPC service definitions and message type definitions for the request and response types that are used by the RPC services.
 
-You will then create your protocol in the [dfs-service.proto](dfs-service.proto) file inside the project repository. There are several required services and message types described in the proto file that you should implement, but you may add as many additional methods and/or message types that you deem necessary. What you name those services and message types is also up to your discretion.
+You will then create your protocol in the `dfs-service.proto` file inside the project repository. There are several required services and message types described in the proto file that you should implement, but you may add as many additional methods and/or message types that you deem necessary. What you name those services and message types is also up to your discretion.
 
 To autogenerate the gRPC and Protocol Buffer class and header files, we’ve provided a Makefile command that will take care of that for you. When you are ready to generate your protobuf/gRPC files, run the following command from the root of the repository:
 
@@ -41,7 +41,7 @@ To autogenerate the gRPC and Protocol Buffer class and header files, we’ve pro
 make protos
 ```
 
-You will find the results of that command in the [part1/proto-src](part1/proto-src) directory of the repository. You should familiarize yourself with the results in that directory, but you won’t need to, and should not, make any changes to those files. Your job will be to override the service methods in your [dfslib-servernode-p1.cpp](dfslib-servnode-p1.cpp) source file.
+You will find the results of that command in the `part1/proto-src` directory of the repository. You should familiarize yourself with the results in that directory, but you won’t need to, and should not, make any changes to those files. Your job will be to override the service methods in your `dfslib-servernode-p1.cpp` source file.
 
 Once you have familiarized yourself with Protocol Buffers, you should next familiarize yourself with the [C++ API for gRPC](https://grpc.github.io/grpc/cpp/index.html). In particular, pay close attention to how the server implementation overrides methods, and the client makes calls to the RPC service for streaming message types.
 
@@ -49,7 +49,7 @@ Once you have familiarized yourself with Protocol Buffers, you should next famil
 
 ## Part 1 Structure
 
-All of the part 1 files are available in the [part1](part1) directory. You will find several source files in that directory, but you are only responsible for adjusting and submitting the `difslib-*` files inside `part1`.  The rest of the source files provide the supporting structure for the program. You may change any of the other source files for your testing purposes, but they will not be submitted as a part of your grade.
+All of the part 1 files are available in the `part1` directory. You will find several source files in that directory, but you are only responsible for adjusting and submitting the `difslib-*` files inside `part1`.  The rest of the source files provide the supporting structure for the program. You may change any of the other source files for your testing purposes, but they will not be submitted as a part of your grade.
 
 In each of the files to be modified, you will find additional instructions and hints on how you should approach the contents of that file. The following comment marker precedes each tip in the source code:
 
