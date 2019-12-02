@@ -23,6 +23,7 @@
 #include "dfslib-shared-p2.h"
 #include "dfslib-clientnode-p2.h"
 #include "proto-src/dfs-service.grpc.pb.h"
+#include <google/protobuf/util/time_util.h>
 
 using grpc::Status;
 using grpc::Channel;
@@ -31,6 +32,14 @@ using grpc::ClientWriter;
 using grpc::ClientReader;
 using grpc::ClientContext;
 
+using google::protobuf::RepeatedPtrField;
+using google::protobuf::util::TimeUtil;
+
+using std::chrono::system_clock;
+using std::chrono::milliseconds;
+
+using namespace dfs_service;
+using namespace std;
 
 extern dfs_log_level_e DFS_LOG_LEVEL;
 
@@ -41,8 +50,8 @@ extern dfs_log_level_e DFS_LOG_LEVEL;
 // message types you are using to indicate
 // a file request and a listing of files from the server.
 //
-using FileRequestType = FileRequest;
-using FileListResponseType = FileList;
+using FileRequestType = dfs_service::File;
+using FileListResponseType = dfs_service::Files;
 
 DFSClientNodeP2::DFSClientNodeP2() : DFSClientNode() {}
 DFSClientNodeP2::~DFSClientNodeP2() {}
@@ -66,6 +75,23 @@ grpc::StatusCode DFSClientNodeP2::RequestWriteAccess(const std::string &filename
     // StatusCode::CANCELLED otherwise
     //
     //
+
+    ClientContext context;
+    context.AddMetadata(ClientIdMetadataKey, ClientId());
+
+    File request;
+    request.set_name(filename);
+
+    WriteLock response;
+
+    Status status = service_stub->AcquireWriteLock(&context, request, &response);
+    if (!status.ok()) {
+        dfs_log(LL_ERROR) << "Acquire lock failed - message: " << status.error_message() << ", code: " << status_code_str(status.error_code());
+        return status.error_code();
+    }
+    dfs_log(LL_SYSINFO) << "Success - response: " << response.DebugString();
+    return StatusCode::OK;
+
 
 }
 
@@ -96,6 +122,66 @@ grpc::StatusCode DFSClientNodeP2::Store(const std::string &filename) {
     //
     //
 
+    const string& filePath = WrapPath(filename);
+
+    struct stat fs;
+    if (stat(filePath.c_str(), &fs) != 0){
+        dfs_log(LL_ERROR) << "File " << filePath << " does not exist";
+        return StatusCode::NOT_FOUND;
+    }
+
+    StatusCode writeLockCode = this->RequestWriteAccess(filename);
+    if (writeLockCode != StatusCode::OK) {
+        return StatusCode::RESOURCE_EXHAUSTED;
+    }
+
+    ClientContext context;
+    context.AddMetadata(FileNameMetadataKey, filename);
+    context.AddMetadata(ClientIdMetadataKey, ClientId());
+    context.AddMetadata(CheckSumMetadataKey, to_string(dfs_file_checksum(filePath, &crc_table)));
+    context.AddMetadata(MtimeMetadataKey, to_string(static_cast<long>(fs.st_mtime)));
+    context.set_deadline(system_clock::now() + milliseconds(deadline_timeout));
+
+    FileAck response;
+
+    int fileSize = fs.st_size;
+
+    unique_ptr<ClientWriter<FileChunk>> resp = service_stub->WriteFile(&context, &response);
+    dfs_log(LL_SYSINFO) << "Storing file " << filePath << "of size " << fileSize;
+    ifstream ifs(filePath);
+    FileChunk chunk;
+    int bytesSent = 0;
+    try {
+        while(!ifs.eof() && bytesSent < fileSize){
+            char buffer[ChunkSize];
+            int bytesToSend = min(fileSize - bytesSent, ChunkSize);
+            ifs.read(buffer, bytesToSend);
+            chunk.set_contents(buffer, bytesToSend);
+            resp->Write(chunk);
+            bytesSent += bytesToSend;
+            dfs_log(LL_SYSINFO) << "Stored " << bytesSent << " of " << fileSize << " bytes";
+        }
+        ifs.close();
+        if (bytesSent != fileSize) {
+            dfs_log(LL_SYSINFO) << "The impossible happened. Sent: " << bytesSent << " File size: " << fileSize << endl;
+            return StatusCode::CANCELLED;
+        }
+    } catch (exception const& e) {
+        dfs_log(LL_ERROR) << "Error while sending file: " << e.what();
+        resp.release();
+        return StatusCode::CANCELLED;
+    }
+    resp->WritesDone();
+    Status status = resp->Finish();
+    if (!status.ok()) {
+        dfs_log(LL_ERROR) << "Store response message: " << status.error_message() << " code: " << status_code_str(status.error_code());
+        if (status.error_code() == StatusCode::INTERNAL) {
+            return StatusCode::CANCELLED;
+        }
+    }
+    dfs_log(LL_SYSINFO) << "Successfully finished storing: " << response.DebugString();
+    return status.error_code();
+
 }
 
 
@@ -122,6 +208,47 @@ grpc::StatusCode DFSClientNodeP2::Fetch(const std::string &filename) {
     //
     // Hint: You may want to match the mtime on local files to the server's mtime
     //
+    const string& filePath = WrapPath(filename);
+
+    ClientContext context;
+    struct stat fs;
+    if (stat(filePath.c_str(), &fs) == 0){
+        dfs_log(LL_SYSINFO) << "File " << filePath << " found on client. Adding mtime metadata";
+        context.AddMetadata(MtimeMetadataKey, to_string(static_cast<long>(fs.st_mtime)));
+    }
+    context.set_deadline(system_clock::now() + milliseconds(deadline_timeout));
+    context.AddMetadata(CheckSumMetadataKey, to_string(dfs_file_checksum(filePath, &crc_table)));
+
+    File request;
+    request.set_name(filename);
+
+    unique_ptr<ClientReader<FileChunk>> response = service_stub->GetFile(&context, request);
+    ofstream ofs;
+    FileChunk chunk;
+    try {
+        while (response->Read(&chunk)) {
+            if (!ofs.is_open()){
+                ofs.open(filePath, ios::trunc);
+            }
+            const string& str = chunk.contents();
+            dfs_log(LL_SYSINFO) << "Writing chunk of size " << str.length() << " bytes";
+            ofs << str;
+        }
+        ofs.close();
+    } catch (exception const& e) {
+        dfs_log(LL_ERROR) << "Error writing to file: " << e.what();
+        response.release();
+        return StatusCode::CANCELLED;
+    }
+    Status status = response->Finish();
+    if (!status.ok()) {
+        dfs_log(LL_ERROR) << "Fetch response message: " << status.error_message() << " code: " << status_code_str(status.error_code());
+        if (status.error_code() == StatusCode::INTERNAL) {
+            return StatusCode::CANCELLED;
+        }
+    }
+    return status.error_code();
+
 }
 
 grpc::StatusCode DFSClientNodeP2::Delete(const std::string &filename) {
@@ -146,6 +273,31 @@ grpc::StatusCode DFSClientNodeP2::Delete(const std::string &filename) {
     //
     //
 
+    StatusCode writeLockCode = this->RequestWriteAccess(filename);
+    if (writeLockCode != StatusCode::OK) {
+        return StatusCode::RESOURCE_EXHAUSTED;
+    }
+
+    ClientContext context;
+    context.set_deadline(system_clock::now() + milliseconds(deadline_timeout));
+    context.AddMetadata(ClientIdMetadataKey, ClientId());
+
+    File request;
+    request.set_name(filename);
+
+    FileAck response;
+
+    Status status = service_stub->DeleteFile(&context, request, &response);
+    if (!status.ok()) {
+        dfs_log(LL_ERROR) << "Delete failed - message: " << status.error_message() << ", code: " << status_code_str(status.error_code());
+        if (status.error_code() == StatusCode::INTERNAL) {
+            return StatusCode::CANCELLED;
+        }
+    }
+    dfs_log(LL_SYSINFO) << "Success - response: " << response.DebugString();
+    return status.error_code();
+
+
 }
 
 grpc::StatusCode DFSClientNodeP2::List(std::map<std::string,int>* file_map, bool display) {
@@ -166,6 +318,29 @@ grpc::StatusCode DFSClientNodeP2::List(std::map<std::string,int>* file_map, bool
     // StatusCode::CANCELLED otherwise
     //
     //
+
+    ClientContext context;
+    context.set_deadline(system_clock::now() + milliseconds(deadline_timeout));
+
+    Empty request;
+    Files response;
+
+    Status status = service_stub->ListFiles(&context, request, &response);
+    if (!status.ok()) {
+        dfs_log(LL_ERROR) << "List files failed - message: " << status.error_message() << ", code: " << status_code_str(status.error_code());
+        if (status.error_code() == StatusCode::INTERNAL) {
+            return StatusCode::CANCELLED;
+        }
+    }
+    dfs_log(LL_SYSINFO) << "Success - response: " << response.DebugString();
+   
+    for (const FileStatus& fs : response.file()) {
+        int seconds = TimeUtil::TimestampToSeconds(fs.modified());
+        file_map->insert(pair<string,int>(fs.name(), seconds));
+        dfs_log(LL_DEBUG2) << "Adding " << fs.name() << " to file map";
+    }
+    return status.error_code();
+
 }
 
 grpc::StatusCode DFSClientNodeP2::Stat(const std::string &filename, void* file_status) {
@@ -187,6 +362,26 @@ grpc::StatusCode DFSClientNodeP2::Stat(const std::string &filename, void* file_s
     // StatusCode::CANCELLED otherwise
     //
     //
+    ClientContext context;
+    context.set_deadline(system_clock::now() + milliseconds(deadline_timeout));
+
+    File request;
+    request.set_name(filename);
+    FileStatus response;
+
+    Status status = service_stub->GetFileStatus(&context, request, &response);
+    if (!status.ok()) {
+        dfs_log(LL_ERROR) << "Delete failed - message: " << status.error_message() << ", code: " << status_code_str(status.error_code());
+        if (status.error_code() == StatusCode::INTERNAL) {
+            return StatusCode::CANCELLED;
+        }
+    }
+    dfs_log(LL_SYSINFO) << "Success - response: " << response.DebugString();
+
+    file_status = &response;
+
+    return status.error_code();
+
 }
 
 void DFSClientNodeP2::InotifyWatcherCallback(std::function<void()> callback) {
@@ -210,9 +405,13 @@ void DFSClientNodeP2::InotifyWatcherCallback(std::function<void()> callback) {
     // the async thread when a file event has been signaled?
     //
 
+    dirMutex.lock();
 
     callback();
 
+    dfs_log(LL_SYSINFO) << "InotifyWatcherCallback callback finished. Unlocking";
+
+    dirMutex.unlock();
 }
 
 //
@@ -283,7 +482,43 @@ void DFSClientNodeP2::HandleCallbackList() {
                 // Do nothing?
                 //
 
+                dirMutex.lock();
 
+                for (const FileStatus& remoteFs : call_data->reply.file()) {
+                    const string& filePath = WrapPath(remoteFs.name());
+
+                    FileStatus localFs;
+                    StatusCode statusCode;
+                    // If file doesn't exist locally or its modified timestamp is less than the server's, fetch it
+                    if (getStat(filePath, &localFs) != 0) {
+                        dfs_log(LL_SYSINFO) << "File " << remoteFs.name() << " doesn't exist locally. Fetching";
+                        if ((statusCode = this->Fetch(remoteFs.name())) != StatusCode::OK) {
+                            dfs_log(LL_ERROR) << "Fetching file failed: " << status_code_str(statusCode);
+                        }
+                        // Fetch it if local timestamp < remote
+                    } else if (remoteFs.modified() > localFs.modified()) {
+                        dfs_log(LL_SYSINFO) << "File " << remoteFs.name() << " is out of date locally. " << "Remote mtime: " << remoteFs.modified() << " Local mtime: " << localFs.modified() << " Storing";
+                        if ((statusCode = this->Fetch(remoteFs.name())) == StatusCode::ALREADY_EXISTS) {
+                            time_t mtime = TimeUtil::TimestampToTimeT(remoteFs.modified());
+                            struct utimbuf ub;
+                            ub.modtime = mtime ;
+                            ub.actime = mtime;
+                            if (!utime(filePath.c_str(), &ub)) {
+                                dfs_log(LL_SYSINFO) << "Updated " << filePath << " mtime to " << mtime;
+                            }
+                        } else if (statusCode != StatusCode::OK) {
+                            dfs_log(LL_ERROR) << "Fetching file failed: " << status_code_str(statusCode);
+                        }
+                        // Store it if local timestamp > remote
+                    } else if (localFs.modified() > remoteFs.modified()) {
+                        dfs_log(LL_SYSINFO) << "File " << remoteFs.name() << " is out of date on server. " << "Remote mtime: " << remoteFs.modified() << " Local mtime: " << localFs.modified() << " Storing";
+                        if ((statusCode = this->Store(remoteFs.name())) != StatusCode::OK) {
+                            dfs_log(LL_ERROR) << "Storing file failed: " << status_code_str(statusCode);
+                        }
+                    }
+                }
+
+                dirMutex.unlock();
 
             } else {
                 dfs_log(LL_ERROR) << "Status was not ok. Will try again in " << DFS_RESET_TIMEOUT << " milliseconds.";

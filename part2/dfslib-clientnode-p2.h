@@ -13,6 +13,8 @@
 #include "src/dfslibx-clientnode-p2.h"
 #include "proto-src/dfs-service.grpc.pb.h"
 
+//using std::shared_timed_mutex;
+
 class DFSClientNodeP2 : public DFSClientNode {
 
 public:
@@ -142,6 +144,8 @@ public:
     // You may add any additional declarations of methods or variables that you need here.
     //
 
+private:
+    mutable std::mutex dirMutex;
 
 };
 #endif

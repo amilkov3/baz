@@ -12,12 +12,14 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <grpcpp/grpcpp.h>
+#include <utime.h>
 
 #include "proto-src/dfs-service.grpc.pb.h"
 #include "src/dfslibx-call-data.h"
 #include "src/dfslibx-service-runner.h"
 #include "dfslib-shared-p2.h"
 #include "dfslib-servernode-p2.h"
+#include <google/protobuf/util/time_util.h>
 
 using grpc::Status;
 using grpc::Server;
@@ -26,9 +28,15 @@ using grpc::ServerReader;
 using grpc::ServerWriter;
 using grpc::ServerContext;
 using grpc::ServerBuilder;
+using grpc::string_ref;
 
-using dfs_service::DFSService;
+using namespace dfs_service;
 
+using google::protobuf::util::TimeUtil;
+using google::protobuf::Timestamp;
+using google::protobuf::uint64;
+
+using namespace std;
 
 //
 // STUDENT INSTRUCTION:
@@ -37,8 +45,11 @@ using dfs_service::DFSService;
 // message types you are using in your `dfs-service.proto` file
 // to indicate a file request and a listing of files from the server
 //
-using FileRequestType = FileRequest;
-using FileListResponseType = FileList;
+using FileRequestType = dfs_service::File;
+using FileListResponseType = dfs_service::Files;
+
+using FileName = string;
+using ClientId = string;
 
 extern dfs_log_level_e DFS_LOG_LEVEL;
 
@@ -98,6 +109,39 @@ private:
     /** CRC Table kept in memory for faster calculations **/
     CRC::Table<std::uint32_t, 32> crc_table;
 
+    shared_timed_mutex filesMutex;
+    map<FileName, ClientId> fileNameToClientId;
+
+    shared_timed_mutex inProgressMutex;
+    map<FileName, unique_ptr<shared_timed_mutex>> inProgressFileNameToMutex;
+
+    shared_timed_mutex dirMutex;
+
+    void ReleaseWriteLock(string fileName) {
+        filesMutex.lock();
+        fileNameToClientId.erase(fileName);
+        filesMutex.unlock();
+    }
+
+    // client and server checksum should not match
+    Status verifyChecksum(const multimap<string_ref, string_ref>& metadata, string& filePath) {
+        auto clientCheckSumV = metadata.find(CheckSumMetadataKey);
+        if (clientCheckSumV == metadata.end()){
+            stringstream ss;
+            ss << "Missing " << CheckSumMetadataKey << " in client metadata" << endl;
+            return Status(StatusCode::INTERNAL, ss.str());
+        }
+        unsigned long clientCheckSum = stoul(string(clientCheckSumV->second.begin(), clientCheckSumV->second.end()));
+        unsigned long serverCheckSum = dfs_file_checksum(filePath, &crc_table);
+        dfs_log(LL_DEBUG2) << "File path: " << filePath << "Client file checksum: " << clientCheckSum << " Server file checksum: " << serverCheckSum;
+        if (clientCheckSum == serverCheckSum) {
+            stringstream ss;
+            ss << "File " << filePath << " contents are the same on client and server" << endl;
+            return Status(StatusCode::ALREADY_EXISTS, ss.str());
+        }
+        return Status::OK;
+    }
+
 public:
 
     DFSServiceImpl(const std::string& mount_path, const std::string& server_address, int num_async_threads):
@@ -108,6 +152,29 @@ public:
         this->runner.SetNumThreads(num_async_threads);
         this->runner.SetQueuedRequestsCallback([&]{ this->ProcessQueuedRequests(); });
 
+        // populate existing files in inProgressFileNameToMutex
+        DIR *dir;
+        if ((dir = opendir(mount_path.c_str())) == NULL) {
+            // could not open directory 
+            dfs_log(LL_ERROR) << "Failed to open directory at mount path " << mount_path;
+            exit(EXIT_FAILURE);
+        }
+        // traverse everything in directory 
+        struct dirent *ent;
+        while ((ent = readdir(dir)) != NULL) {
+            struct stat path_stat;
+            string dirEntry(ent->d_name);
+            string path = WrapPath(dirEntry);
+            stat(path.c_str(), &path_stat);
+            // if dir item is a file
+            if (!S_ISREG(path_stat.st_mode)){
+                dfs_log(LL_SYSINFO) << "Found dir at " << path << " - Skipping";
+                continue;
+            }
+            dfs_log(LL_SYSINFO) << "Found file at " << path;
+            inProgressFileNameToMutex[dirEntry] = make_unique<shared_timed_mutex>();
+        }
+        closedir(dir);
     }
 
     ~DFSServiceImpl() {
@@ -167,6 +234,14 @@ public:
         // The client should receive a list of files or modifications that represent the changes this service
         // is aware of. The client will then need to make the appropriate calls based on those changes.
         //
+        dfs_log(LL_DEBUG2) << "Handling ProcessCallback call. Filename: " << request->name();
+        Status status = this->CallbackList(context, request, response);
+
+        if (!status.ok()) {
+            dfs_log(LL_ERROR) << "CallbackList via ProcessCallback failed - message: " << status.error_message() << ", code: " << status_code_str(status.error_code());
+            return;
+        }
+        dfs_log(LL_DEBUG2) << "ProcessCallback success - response: " << response->DebugString();
 
     }
 
@@ -216,6 +291,480 @@ public:
     // Add your additional code here, including
     // the implementations of your rpc protocol methods.
     //
+
+    Status AcquireWriteLock(
+        ServerContext* context,
+        const File* request,
+        WriteLock* response
+    ) override {
+        const multimap<string_ref, string_ref>& metadata = context->client_metadata();
+        auto clientIdV = metadata.find(ClientIdMetadataKey);
+        // File name is missing
+        if (clientIdV == metadata.end()){
+            stringstream ss;
+            ss << "Missing " << ClientIdMetadataKey << " in client metadata" << endl;
+            dfs_log(LL_ERROR) << ss.str();
+            return Status(StatusCode::INTERNAL, ss.str());
+        }
+        auto clientId = string(clientIdV->second.begin(), clientIdV->second.end());
+
+        filesMutex.lock();
+        auto lockClientIdV = fileNameToClientId.find(request->name());
+        string lockClientId;
+        if (lockClientIdV != fileNameToClientId.end() && (lockClientId = lockClientIdV->second).compare(clientId) != 0){
+            filesMutex.unlock();
+
+            stringstream ss;
+            ss << "Acquiring lock failed. File " << request->name() << " already has a write lock from client " << lockClientId << " Your id: " << clientId;
+            dfs_log(LL_ERROR) << ss.str();
+            return Status(StatusCode::RESOURCE_EXHAUSTED, ss.str());
+        } else if (lockClientId.compare(clientId) == 0) {
+            filesMutex.unlock();
+
+            dfs_log(LL_SYSINFO) << "Your client id " << clientId << " already has a lock on " << request->name();
+            return Status::OK;
+        }
+        fileNameToClientId[request->name()] = clientId;
+        if (inProgressFileNameToMutex.find(request->name()) == inProgressFileNameToMutex.end()){
+            inProgressFileNameToMutex[request->name()] =  make_unique<shared_timed_mutex>();
+        }
+        filesMutex.unlock();
+
+        return Status::OK;
+    }
+
+    Status WriteFile(
+        ServerContext* context,
+        ServerReader<FileChunk>* reader,
+        FileAck* response
+    ) override {
+        const multimap<string_ref, string_ref>& metadata = context->client_metadata();
+        auto fileNameV = metadata.find(FileNameMetadataKey);
+        auto clientIdV = metadata.find(ClientIdMetadataKey);
+        auto mtimeV = metadata.find(MtimeMetadataKey);
+
+        // File name is missing
+        if (fileNameV == metadata.end()){
+            stringstream ss;
+            ss << "Missing " << FileNameMetadataKey << " in client metadata" << endl;
+            dfs_log(LL_ERROR) << ss.str();
+            return Status(StatusCode::INTERNAL, ss.str());
+            // Client id is missing
+        } else if (clientIdV == metadata.end()){
+            stringstream ss;
+            ss << "Missing " << ClientIdMetadataKey << " in client metadata" << endl;
+            dfs_log(LL_ERROR) << ss.str();
+            return Status(StatusCode::INTERNAL, ss.str());
+        } else if (mtimeV == metadata.end()){
+            stringstream ss;
+            ss << "Missing " << MtimeMetadataKey << " in client metadata" << endl;
+            dfs_log(LL_ERROR) << ss.str();
+            return Status(StatusCode::INTERNAL, ss.str());
+        }
+        auto fileName = string(fileNameV->second.begin(), fileNameV->second.end());
+        auto clientId = string(clientIdV->second.begin(), clientIdV->second.end());
+        long mtime = stol(string(mtimeV->second.begin(), mtimeV->second.end()));
+
+        string filePath = WrapPath(fileName);
+
+        filesMutex.lock_shared();
+        auto lockClientIdV = fileNameToClientId.find(fileName);
+        auto fileAccessMutexV = inProgressFileNameToMutex.find(fileName);
+        // TODO: Skipping check whether it exists
+        shared_timed_mutex* fileAccessMutex = fileAccessMutexV->second.get();
+        string lockClientId;
+        if (lockClientIdV == fileNameToClientId.end()){
+            filesMutex.unlock_shared();
+
+            stringstream ss;
+            ss << "Your client id " << clientId << " doesn't have a write lock for file " << fileName;
+            dfs_log(LL_ERROR) << ss.str();
+            return Status(StatusCode::INTERNAL, ss.str());
+        } else if ((lockClientId = lockClientIdV->second).compare(clientId) != 0) {
+            filesMutex.unlock_shared();
+
+            stringstream ss;
+            ss << "File " << fileName << " already has a lock from client " << lockClientId << " Your id: " << clientId;
+            dfs_log(LL_ERROR) << ss.str();
+            return Status(StatusCode::INTERNAL, ss.str());
+        }
+        filesMutex.unlock_shared();
+
+        dirMutex.lock();
+        fileAccessMutex->lock();
+
+        Status checkSumResult = verifyChecksum(metadata, filePath);
+        if (!checkSumResult.ok()){
+            struct stat fs;
+            if ((stat(filePath.c_str(), &fs) == 0) && (mtime > fs.st_mtime)){
+                dfs_log(LL_SYSINFO) << "Client mtime " << mtime << " greater than server mtime" << fs.st_mtime << " but contents are the same. Updating";
+                struct utimbuf ub;
+                ub.modtime = mtime;
+                ub.actime = mtime;
+                if (!utime(filePath.c_str(), &ub)) {
+                    dfs_log(LL_SYSINFO) << "Updated " << filePath << " mtime to " << mtime;
+                }
+            }
+            ReleaseWriteLock(fileName);
+            fileAccessMutex->unlock();
+            dirMutex.unlock();
+
+            dfs_log(LL_ERROR) << checkSumResult.error_message();
+            return checkSumResult;
+        }
+
+        dfs_log(LL_SYSINFO) << "Writing file " << filePath << "Client id: " << clientId;
+
+        FileChunk chunk;
+        ofstream ofs;
+        
+        try {
+            while (reader->Read(&chunk)) {
+                if (!ofs.is_open()) {
+                    ofs.open(filePath, ios::trunc);
+                }
+
+                if (context->IsCancelled()){
+                    ReleaseWriteLock(fileName);
+                    fileAccessMutex->unlock();
+                    dirMutex.unlock();
+
+                    const string& err = "Request deadline has expired";
+                    dfs_log(LL_ERROR) << err;
+                    return Status(StatusCode::DEADLINE_EXCEEDED, err);
+                }
+
+                const string& chunkStr = chunk.contents();
+                ofs << chunkStr;
+                dfs_log(LL_SYSINFO) << "Wrote chunk of size " << chunkStr.length();
+            }
+            ofs.close();
+            ReleaseWriteLock(fileName);
+        } catch (exception const& e) {
+            ReleaseWriteLock(fileName);
+            fileAccessMutex->unlock();
+            dirMutex.unlock();
+
+            stringstream ss;
+            ss << "Error writing to file " << e.what() << endl;
+            dfs_log(LL_ERROR) << ss.str();
+            return Status(StatusCode::INTERNAL, ss.str());
+        }
+        FileStatus fs;
+        if (getStat(filePath, &fs) != 0) {
+            fileAccessMutex->unlock();
+            dirMutex.unlock();
+
+            stringstream ss;
+            ss << "Getting file info for file " << filePath << " failed with: " << strerror(errno) << endl;
+            dfs_log(LL_ERROR) << ss.str();
+            return Status(StatusCode::NOT_FOUND, ss.str());
+        }
+        fileAccessMutex->unlock();
+        dirMutex.unlock();
+
+        response->set_name(fileName);
+        Timestamp* modified = new Timestamp(fs.modified());
+        response->set_allocated_modified(modified);
+        return Status::OK;
+    }
+
+    Status GetFile(
+        ServerContext* context, 
+        const File* request,
+        ServerWriter<FileChunk>* writer
+    ) override {
+        string filePath = WrapPath(request->name());
+        
+        filesMutex.lock();
+        if (inProgressFileNameToMutex.find(request->name()) == inProgressFileNameToMutex.end()){
+            inProgressFileNameToMutex[request->name()] =  make_unique<shared_timed_mutex>();
+        }         
+        shared_timed_mutex* fileAccessMutex = inProgressFileNameToMutex.find(request->name())->second.get();
+        filesMutex.unlock();
+
+        fileAccessMutex->lock_shared();
+
+        struct stat fs;
+        if (stat(filePath.c_str(), &fs) != 0){
+            fileAccessMutex->unlock_shared();
+
+            stringstream ss;
+            ss << "File " << filePath << " does not exist" << endl;
+            dfs_log(LL_ERROR) << ss.str();
+            return Status(StatusCode::NOT_FOUND, ss.str());
+        }
+
+        Status checkSumResult = verifyChecksum(context->client_metadata(), filePath);
+        if (!checkSumResult.ok()){
+            fileAccessMutex->unlock_shared();
+
+            const multimap<string_ref, string_ref>& metadata = context->client_metadata();
+            auto mtimeV = metadata.find(MtimeMetadataKey);
+            if (mtimeV == metadata.end()){
+                stringstream ss;
+                ss << "Missing " << MtimeMetadataKey << " in client metadata" << endl;
+                dfs_log(LL_ERROR) << ss.str();
+                return Status(StatusCode::INTERNAL, ss.str());
+            }
+            long mtime = stol(string(mtimeV->second.begin(), mtimeV->second.end()));
+
+            if (mtime > fs.st_mtime){
+                dfs_log(LL_SYSINFO) << "Client mtime " << mtime << " greater than server mtime" << fs.st_mtime << " but contents are the same. Updating";
+                struct utimbuf ub;
+                ub.modtime = mtime;
+                ub.actime = mtime;
+                if (!utime(filePath.c_str(), &ub)) {
+                    dfs_log(LL_SYSINFO) << "Updated " << filePath << " mtime to " << mtime;
+                }
+            }
+            dfs_log(LL_ERROR) << checkSumResult.error_message();
+            return checkSumResult;
+        }
+
+        dfs_log(LL_SYSINFO) << "Retrieving file " << filePath;
+
+        int fileSize = fs.st_size;
+        
+        ifstream ifs(filePath);
+        FileChunk chunk;
+        try {
+            int bytesSent = 0;
+            while(!ifs.eof() && bytesSent < fileSize){
+                int bytesToSend = min(fileSize - bytesSent, ChunkSize);
+                char buffer[ChunkSize];
+                if (context->IsCancelled()){
+                    fileAccessMutex->unlock_shared();
+                    const string& err = "Request deadline has expired";
+                    dfs_log(LL_ERROR) << err;
+                    return Status(StatusCode::DEADLINE_EXCEEDED, err);
+                }
+                ifs.read(buffer, bytesToSend);
+                chunk.set_contents(buffer, bytesToSend);
+                writer->Write(chunk);
+                dfs_log(LL_SYSINFO) << "Returned chunk of size " << bytesToSend << " bytes";
+                bytesSent += bytesToSend;
+            }
+            ifs.close();
+            fileAccessMutex->unlock_shared();
+            if (bytesSent != fileSize) {
+                stringstream ss;
+                ss << "The impossible happened" << endl;
+                return Status(StatusCode::INTERNAL, ss.str());
+            }
+        } catch (exception const& e) {
+            fileAccessMutex->unlock_shared();
+            stringstream ss;
+            ss << "Error reading file " << e.what() << endl;
+            dfs_log(LL_ERROR) << ss.str();
+            return Status(StatusCode::INTERNAL, ss.str());
+        }
+
+        dfs_log(LL_SYSINFO) << "Finished retrieving file " << filePath;
+
+        return Status::OK;
+    }
+
+    Status DeleteFile(
+        ServerContext* context, 
+        const File* request,
+        FileAck* response
+    ) override {
+        const string& filePath = WrapPath(request->name());
+
+        const multimap<string_ref, string_ref>& metadata = context->client_metadata();
+        // Retrieve client id
+        auto clientIdV = metadata.find(ClientIdMetadataKey);
+        if (clientIdV == metadata.end()){
+            stringstream ss;
+            ss << "Missing " << ClientIdMetadataKey << " in client metadata" << endl;
+            dfs_log(LL_ERROR) << ss.str();
+            return Status(StatusCode::INTERNAL, ss.str());
+        }
+        auto clientId = string(clientIdV->second.begin(), clientIdV->second.end());
+        
+        filesMutex.lock_shared();
+        auto lockClientIdV = fileNameToClientId.find(request->name());
+        if (inProgressFileNameToMutex.find(request->name()) == inProgressFileNameToMutex.end()){
+            inProgressFileNameToMutex[request->name()] =  make_unique<shared_timed_mutex>();
+        }         
+        shared_timed_mutex* fileAccessMutex = inProgressFileNameToMutex.find(request->name())->second.get();
+        string lockClientId;
+        if (lockClientIdV == fileNameToClientId.end()){
+            filesMutex.unlock_shared();
+            stringstream ss;
+            ss << "Your client id " << clientId << " doesn't have a write lock for file " << request->name();
+            dfs_log(LL_ERROR) << ss.str();
+            return Status(StatusCode::INTERNAL, ss.str());
+        } else if ((lockClientId = lockClientIdV->second).compare(clientId) != 0) {
+            filesMutex.unlock_shared();
+            stringstream ss;
+            ss << "File " << request->name() << " already has a lock from client " << lockClientId << ". Your id: " << clientId;
+            dfs_log(LL_ERROR) << ss.str();
+            return Status(StatusCode::INTERNAL, ss.str());
+        }
+        filesMutex.unlock_shared();
+
+
+        dfs_log(LL_SYSINFO) << "Deleting file " << filePath;
+        dirMutex.lock();
+        fileAccessMutex->lock();
+        // File doesnt exist
+        FileStatus fs;
+        if (getStat(filePath, &fs) != 0) {
+            ReleaseWriteLock(request->name());
+            fileAccessMutex->unlock();
+            dirMutex.unlock();
+
+            stringstream ss;
+            ss << "File " << filePath << " doesn't exist" << endl;
+            dfs_log(LL_ERROR) << ss.str();
+            return Status(StatusCode::NOT_FOUND, ss.str());
+        }
+        if (context->IsCancelled()){
+            ReleaseWriteLock(request->name());
+            fileAccessMutex->unlock();
+            dirMutex.unlock();
+
+            const string& err = "Request deadline has expired";
+            dfs_log(LL_ERROR) << err;
+            return Status(StatusCode::DEADLINE_EXCEEDED, err);
+        }
+        // Delete file
+        if (remove(filePath.c_str()) != 0) {
+            ReleaseWriteLock(request->name());
+            fileAccessMutex->unlock();
+            dirMutex.unlock();
+
+            stringstream ss;
+            ss << "Removing file " << filePath << " failed with: " << strerror(errno) << endl;
+            return Status(StatusCode::INTERNAL, ss.str());
+        }
+        ReleaseWriteLock(request->name());
+        fileAccessMutex->unlock();
+        dirMutex.unlock();
+
+        response->set_name(request->name());
+        Timestamp* modified = new Timestamp(fs.modified());
+        response->set_allocated_modified(modified);
+        dfs_log(LL_SYSINFO) << "Deleted file successfully";
+        return Status::OK;
+    }
+
+    Status ListFiles(
+        ServerContext* context,
+        const Empty* request,
+        Files* response
+    ) override {
+        dirMutex.lock_shared();
+        DIR *dir;
+        /*if (context->IsCancelled()){
+            dfs_log(LL_SYSINFO) << "we fucked";
+            dirMutex.unlock_shared();
+
+            const string& err = "Request deadline has expired";
+            dfs_log(LL_ERROR) << err;
+        }*/
+        if ((dir = opendir(mount_path.c_str())) == NULL) {
+            /* could not open directory */
+            dfs_log(LL_ERROR) << "Failed to open directory at mount path " << mount_path;
+            return Status::OK;
+        }
+        /* traverse everything in directory */
+        struct dirent *ent;
+        while ((ent = readdir(dir)) != NULL) {
+            /*if (context->IsCancelled()){
+                dirMutex.unlock_shared();
+
+                const string& err = "Request deadline has expired";
+                dfs_log(LL_ERROR) << err;
+                return Status(StatusCode::DEADLINE_EXCEEDED, err);
+            }*/
+            struct stat path_stat;
+            string dirEntry(ent->d_name);
+            string path = WrapPath(dirEntry);
+            stat(path.c_str(), &path_stat);
+            /* if dir item is a file */
+            if (!S_ISREG(path_stat.st_mode)){
+                dfs_log(LL_DEBUG2) << "Found dir at " << path << " - Skipping";
+                continue;
+            }
+            dfs_log(LL_DEBUG2) << "Found file at " << path;
+            FileStatus* ack = response->add_file();
+            FileStatus status;
+            if (getStat(path, &status) != 0) {
+                dirMutex.unlock_shared();
+
+                stringstream ss;
+                ss << "Getting file info for file " << path << " failed with: " << strerror(errno) << endl;
+                dfs_log(LL_ERROR) << ss.str();
+                return Status(StatusCode::NOT_FOUND, ss.str());
+            }
+            /*
+            ack->set_name(dirEntry);
+            Timestamp* modified = new Timestamp(status.modified());
+            ack->set_allocated_modified(modified);
+            */
+           ack->set_name(dirEntry);
+           Timestamp* modified = new Timestamp(status.modified());
+           Timestamp* created = new Timestamp(status.created());
+           ack->set_allocated_created(created);
+           ack->set_allocated_modified(modified);
+           ack->set_size(status.size());
+        }
+        closedir(dir);
+        dirMutex.unlock_shared();
+
+        return Status::OK;
+    }
+
+    Status GetFileStatus(
+        ServerContext* context,
+        const File* request,
+        FileStatus* response
+    ) override {
+        cout << "\n";
+        if (context->IsCancelled()){
+            const string& err = "Request deadline has expired";
+            dfs_log(LL_ERROR) << err;
+            return Status(StatusCode::DEADLINE_EXCEEDED, err);
+        }
+
+        string filePath = WrapPath(request->name());
+
+        filesMutex.lock();
+        if (inProgressFileNameToMutex.find(request->name()) == inProgressFileNameToMutex.end()){
+            inProgressFileNameToMutex[request->name()] =  make_unique<shared_timed_mutex>();
+        }         
+        shared_timed_mutex* fileAccessMutex = inProgressFileNameToMutex.find(request->name())->second.get();
+        filesMutex.unlock();
+
+        fileAccessMutex->lock_shared();
+
+        /* Get FileStatus of file */
+        if (getStat(filePath, response) != 0) {
+            fileAccessMutex->unlock_shared();
+
+            stringstream ss;
+            ss << "Getting file info for file " << filePath << " failed with: " << strerror(errno) << endl;
+            dfs_log(LL_ERROR) << ss.str();
+            return Status(StatusCode::NOT_FOUND, ss.str());
+        }
+        fileAccessMutex->unlock_shared();
+
+        return Status::OK;
+    }
+
+    Status CallbackList(
+        ServerContext* context,
+        const File* request,
+        Files* response
+    ) override {
+        dfs_log(LL_DEBUG2) << "Handling CallbackList call. Filename: " << request->name();
+        Empty request1;
+        return this->ListFiles(context, &request1, response);
+    }
+
 
 
 };

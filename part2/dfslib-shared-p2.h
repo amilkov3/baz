@@ -14,6 +14,7 @@
 
 #include "src/dfs-utils.h"
 #include "proto-src/dfs-service.grpc.pb.h"
+#include <google/protobuf/util/time_util.h>
 
 
 //
@@ -56,6 +57,30 @@ struct EventStruct {
 // Add any additional shared code here
 //
 
+extern const char* ClientIdMetadataKey;
+extern const char* FileNameMetadataKey;
+extern const char* CheckSumMetadataKey;
+extern const char* MtimeMetadataKey;
+
+extern int ChunkSize;
+
+int getStat(std::string path, dfs_service::FileStatus* fs);
+
+inline std::string status_code_str(grpc::StatusCode code) {
+    switch (code) {
+        case grpc::StatusCode::OK: return "OK";
+        case grpc::StatusCode::INTERNAL: return "INTERNAL";
+        case grpc::StatusCode::DEADLINE_EXCEEDED: return "DEADLINE_EXCEEDED";
+        case grpc::StatusCode::RESOURCE_EXHAUSTED: return "RESOURCE_EXHAUSTED";
+        case grpc::StatusCode::CANCELLED: return "CANCELLED";
+        case grpc::StatusCode::NOT_FOUND: return "NOT_FOUND";
+        case grpc::StatusCode::ALREADY_EXISTS: return "ALREADY_EXISTS";
+        default: 
+            std::stringstream ss;
+            ss << code; 
+            return ss.str();
+    }
+}
 
 #endif
 

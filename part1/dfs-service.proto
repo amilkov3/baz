@@ -2,19 +2,26 @@ syntax = "proto3";
 
 package dfs_service;
 
+import "google/protobuf/timestamp.proto";
+
 service DFSService {
 
     // Add your service calls here
 
     // 1. REQUIRED (Parts 1 & 2): A method to store files on the server
+    rpc WriteFile (stream FileChunk) returns (FileAck);
 
     // 2. REQUIRED (Parts 1 & 2): A method to fetch files from the server
+    rpc GetFile (File) returns (stream FileChunk);
 
     // 3. REQUIRED (Parts 1 & 2): A method to delete files from the server
+    rpc DeleteFile (File) returns (FileAck);
 
     // 4. REQUIRED (Parts 1 & 2): A method to list all files on the server
+    rpc ListFiles (Empty) returns (Files);
 
     // 5. REQUIRED (Parts 1 & 2): A method to get the status of a file on the server
+    rpc GetFileStatus (File) returns (FileStatus);
 
     // 6. REQUIRED (Part 2 only): A method to request a write lock from the server
 
@@ -25,4 +32,31 @@ service DFSService {
 }
 
 // Add your message types here
+message FileChunk {
+    bytes contents = 1;
+}
+
+message FileAck {
+    string file_name = 1;
+    google.protobuf.Timestamp modified = 2;
+}
+
+message File {
+    string file_name = 1;
+}
+
+message Empty {
+}
+
+message Files {
+    repeated FileAck file = 1;
+}
+
+message FileStatus {
+    string file_name = 1;
+    google.protobuf.Timestamp modified = 2;
+    google.protobuf.Timestamp created = 3;
+    uint64 size = 4;
+}
+
 
