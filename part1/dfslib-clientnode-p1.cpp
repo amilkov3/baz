@@ -215,12 +215,10 @@ StatusCode DFSClientNodeP1::Delete(const std::string& filename) {
 
     File request;
     request.set_file_name(filename);
-    File& request1{request};
 
     FileAck response;
 
-
-    Status status = service_stub->DeleteFile(&context, request1, &response);
+    Status status = service_stub->DeleteFile(&context, request, &response);
     if (!status.ok()) {
         dfs_log(LL_ERROR) << "Delete failed - message: " << status.error_message() << ", code: " << status.error_code();
         if (status.error_code() == StatusCode::INTERNAL) {
@@ -256,8 +254,7 @@ StatusCode DFSClientNodeP1::List(std::map<std::string,int>* file_map, bool displ
     ClientContext context;
     context.set_deadline(system_clock::now() + milliseconds(deadline_timeout));
 
-    Empty e = Empty();
-    Empty& request{e};
+    Empty request;
     Files response;
 
     Status status = service_stub->ListFiles(&context, request, &response);

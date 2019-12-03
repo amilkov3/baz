@@ -30,9 +30,6 @@ dfs_log_level_e DFS_LOG_LEVEL = LL_ERROR;
 // be compilable.
 //
 
-//const string& FileNameMetadataKey = "file_name";
-//const int ChunkSize = 5120;
-//static char* FileNameMetadataKey = "file_name";
 const char *FileNameMetadataKey = "file_name";
 int ChunkSize = 5120;
 

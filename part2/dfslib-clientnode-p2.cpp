@@ -163,7 +163,7 @@ grpc::StatusCode DFSClientNodeP2::Store(const std::string &filename) {
         }
         ifs.close();
         if (bytesSent != fileSize) {
-            dfs_log(LL_SYSINFO) << "The impossible happened. Sent: " << bytesSent << " File size: " << fileSize << endl;
+            dfs_log(LL_SYSINFO) << "The impossible happened. Sent: " << bytesSent << " File size: " << fileSize;
             return StatusCode::CANCELLED;
         }
     } catch (exception const& e) {
@@ -502,9 +502,10 @@ void DFSClientNodeP2::HandleCallbackList() {
                             time_t mtime = TimeUtil::TimestampToTimeT(remoteFs.modified());
                             struct utimbuf ub;
                             ub.modtime = mtime ;
-                            ub.actime = mtime;
                             if (!utime(filePath.c_str(), &ub)) {
                                 dfs_log(LL_SYSINFO) << "Updated " << filePath << " mtime to " << mtime;
+                            } else {
+                                dfs_log(LL_ERROR) << "Updating mtime for " << filePath << " failed with: " << strerror(errno);
                             }
                         } else if (statusCode != StatusCode::OK) {
                             dfs_log(LL_ERROR) << "Fetching file failed: " << status_code_str(statusCode);
